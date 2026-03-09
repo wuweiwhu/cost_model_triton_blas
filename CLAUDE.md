@@ -4,7 +4,115 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-tritonBLAS is a lightweight Triton-based GEMM (General Matrix Multiplication) library that uses an analytical model (Origami) to predict optimal kernel configurations instead of autotuning. It targets AMD MI300X GPUs (ROCm/HIP platform).
+tritonBLAS is a lightweight Triton-based GEMM (General Matrix Multiplication) library that uses an analytical model (Origami) to predict optimal kernel configurations instead of autotuning.
+
+**Current Status**: AMD MI300X (CDNA3/ROCm) support is implemented.
+**Porting Target**: NVIDIA Blackwell (tcgen05 Tensor Core) - IN PROGRESS.
+
+## NVIDIA Blackwell (tcgen05) Porting Plan
+
+### Hardware Differences Summary
+
+| Feature | AMD MI300X (CDNA3) | NVIDIA Blackwell (tcgen05) |
+|---------|-------------------|---------------------------|
+| **Tensor Core** | MFMA (Matrix Fused Multiply-Add) | tcgen05.mma_async |
+| **Thread Organization** | Wave64 (64 threads) | Warp32 (32 threads) |
+| **Compute Units** | CUs with 4 SIMD units per CU | SMs with Tensor Cores |
+| **Cache Hierarchy** | L1 → L2 → HBM | Shared Mem → L1 → L2 → HBM |
+| **Async Operations** | Limited | Extensive (TMA, async mma) |
+| **Software Stack** | ROCm/HIP | CUDA 12.8+ |
+
+### Key Porting Tasks
+
+#### 1. Hardware Model Updates (`include/tritonblas/origami.py`)
+- Replace `origami.get_hardware_for_device()` with Blackwell hardware parameters
+- Update `N_CU` → `num_SMs` ( Streaming Multiprocessors)
+- Add tcgen05-specific matrix instruction latencies
+- Update memory bandwidth and cache size constants
+
+```python
+# Example hardware parameters for Blackwell
+blackwell_hw_params = {
+    "num_sms": 128,  # GB200 GPU
+    "sm_clock_ghz": 1.8,
+    "tensor_core_throughput": "2x FP16/BF16 per SM per clock",
+    "shared_mem_per_sm": 256 * 1024,  # 256 KB
+    "l2_cache_size": 96 * 1024 * 1024,  # 96 MB
+    "hbm_bandwidth_gbps": 8000,  # 8 TB/s
+}
+```
+
+#### 2. Kernel Updates (`include/tritonblas/kernels/`)
+
+**Persistent GEMM** (`persistent_gemm.py`):
+- Replace `tl.dot()` with tcgen05-specific mma instructions (via Triton intrinsics)
+- Update block sizes for Warp32 execution (128x128 or 256x256 → 128x64/64x128)
+- Add TMA (Tensor Memory Accelerator) support for async loads
+- Adjust `num_warps` from 8 (for Wave64) to 4/8 (for Warp32)
+
+**Stream-K GEMM** (`streamk_gemm.py`):
+- Same changes as persistent GEMM
+- Update atomics for inter-SM synchronization (Blackwell has different memory ordering)
+
+**FP4 Support** (`fp4_matmul.py`):
+- tcgen05 has native FP4 support - leverage `tcgen05.mma` with FP4 input types
+- Update scaling factors for Blackwell's FP4 format
+
+#### 3. Build System Updates
+
+**`setup.py`**:
+- Remove hipBLASLt dependency (AMD-specific)
+- Add cuBLASLt or cutlass dependency for reference implementations
+- Update to CUDA 12.8+ toolchain
+
+**`Dockerfile`**:
+- Replace `rocm/pytorch:latest-release` with `nvidia/cuda:12.8-devel-ubuntu22.04`
+- Install PyTorch with CUDA support
+- Install Triton with NVIDIA backend
+
+#### 4. Triton Intrinsic Mapping
+
+| AMD (ROCm) | NVIDIA (CUDA) | Notes |
+|------------|---------------|-------|
+| `tl.dot()` | `tl.dot()` + `allow_tf32` | May need `trans_a/trans_b` hints |
+| `maxntid` | `num_threads` | Already abstracted in Triton |
+| `waveid` | `warp_id` | Triton provides abstraction |
+| MFMA-specific | `nvidia_tc_gen5_mma` | Use Triton's target-specific intrinsics |
+
+#### 5. Testing Updates
+
+**New test requirements**:
+- Blackwell GPU (GB200 or B100/B200)
+- CUDA 12.8+ driver
+- Triton with NV backend enabled
+
+**Verification**:
+- Performance parity with cuBLASLt
+- Correctness against PyTorch CUDA matmul
+
+### Development Environment (NVIDIA)
+
+```bash
+# Docker for Blackwell development
+docker run --gpus all -it nvidia/cuda:12.8-devel-ubuntu22.04
+
+# Install PyTorch with CUDA 12.8
+pip install torch --index-url https://download.pytorch.org/whl/cu128
+
+# Install Triton (latest with Blackwell support)
+pip install triton
+
+# Install package
+pip install -e .
+```
+
+### Performance Targets (Blackwell)
+
+| Data Type | Target Utilization |
+|-----------|-------------------|
+| FP16/BF16 | >90% of theoretical tcgen05 peak |
+| FP8 | >85% of theoretical peak |
+| FP4 | >80% of theoretical peak (new in Blackwell) |
 
 ## Development Environment
 
@@ -125,7 +233,14 @@ Correctness is verified against `torch.matmul` with `torch.testing.assert_close(
 
 ### Dependencies
 
+**AMD (Current)**:
 - `triton`: Core JIT compilation (installed from source in Docker)
 - `origami`: Analytical model from hipBLASLt (cloned and built during `pip install`)
 - `torch`: PyTorch with ROCm support
 - `pandas`, `pytest`, `ruff`, `llnl-hatchet`: Development dependencies
+
+**NVIDIA (Porting Target)**:
+- `triton`: Core JIT compilation with NV backend
+- `torch`: PyTorch with CUDA 12.8+ support
+- Reference: cuBLASLt or CUTLASS for validation
+- Same Python dev dependencies
