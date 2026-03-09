@@ -244,3 +244,61 @@ Correctness is verified against `torch.matmul` with `torch.testing.assert_close(
 - `torch`: PyTorch with CUDA 12.8+ support
 - Reference: cuBLASLt or CUTLASS for validation
 - Same Python dev dependencies
+
+## TCGen05 Analytical Model
+
+A new analytical performance model (`tcgen05_model.py`) has been implemented for NVIDIA Blackwell GPUs. This model predicts kernel performance without running autotune, similar to the Origami model for AMD.
+
+### Key Components
+
+**`TCGen05PerformanceModel`**: Core analytical model that estimates:
+- tcgen05.mma_async instruction throughput and latency
+- TMA (Tensor Memory Accelerator) async load performance
+- Memory bandwidth limitations
+- Wave quantization effects
+- Pipeline stall conditions
+
+**`TCGen05MatmulSelector`**: High-level interface for selecting optimal configurations:
+```python
+from tritonblas import TCGen05MatmulSelector
+
+selector = TCGen05MatmulSelector(m, n, k, a_dtype, b_dtype, c_dtype, "GB200")
+print(selector.predicted_tflops)  # Predicted performance
+print(selector.get_performance_report())  # Detailed analysis
+```
+
+### Model Architecture
+
+The model considers:
+
+1. **Compute Cycles**: Based on tcgen05 instruction count and issue rate
+   - tcgen05 shape: 128x8x64 for FP16, scaled for FP8/FP4
+   - Latency hiding through software pipelining (2-4 stages)
+
+2. **Memory Cycles**: TMA async loads overlap with compute
+   - Only 10% of memory traffic on critical path (estimated)
+   - Accounts for HBM bandwidth
+
+3. **Wave Quantization**: Penalty for partial waves
+   - Analyzes total tiles vs SM count
+   - Recommends Stream-K when last wave utilization < 50%
+
+### Usage Example
+
+```python
+from tritonblas import TCGen05MatmulSelector, predict_gemm_performance
+import torch
+
+# Predict performance without running kernel
+selector = TCGen05MatmulSelector(
+    8192, 8192, 8192,
+    torch.float16, torch.float16, torch.float16,
+    gpu_name="GB200"
+)
+
+print(f"Optimal config: [{selector.block_m}, {selector.block_n}, {selector.block_k}]")
+print(f"Predicted: {selector.predicted_tflops:.1f} TFLOPS ({selector.predicted_utilization:.1f}%)")
+print(f"Bottleneck: {selector.bottleneck}")
+```
+
+See `examples/example_tcgen05_model.py` for comprehensive usage examples.
